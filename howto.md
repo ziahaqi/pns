@@ -25,8 +25,9 @@ curl -X POST http://localhost:8080/api/v1/devices/register \
 - Use the Users section in the admin UI to add or remove admins.
 
 Environment variables (must be set)
-- `SERVER_KEY` – shared secret for device API and FCM sending
-- `SESSION_SECRET` – cookie signing key
+- `SERVER_KEY` – shared secret for the device API (it ships in the mobile app)
+- `SESSION_SECRET` – cookie signing key; required, no default
+- `FCM_SERVER_KEY` – optional key for sending pushes; when unset, activating a promotion sends nothing
 - `DATABASE_URL` – PostgreSQL DSN
 - `ADMIN_EMAIL`/`ADMIN_PASSWORD` – optional bootstrap admin
 

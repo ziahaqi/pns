@@ -1,17 +1,21 @@
 package service
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
-	"log"
+	"io"
 	"net/http"
-	"strings"
 	"time"
 )
 
-// NotificationService is a thin wrapper to call FCM HTTP v1 endpoints.
-// In this offline-friendly implementation we just perform an HTTP POST if the URL is reachable.
+// NotificationService is a thin wrapper around the FCM HTTP endpoint.
 // Replace APIURL/ServerKey with your own values for production.
+//
+// Note: this speaks the legacy FCM HTTP protocol (fcm/send with a server key),
+// which Google has shut down; moving to the HTTP v1 API needs a service
+// account and an OAuth access token.
 type NotificationService struct {
 	APIURL    string
 	ServerKey string
@@ -32,29 +36,50 @@ func NewNotificationService(serverKey string) *NotificationService {
 	}
 }
 
+// Configured reports whether there is a key to send with.
+func (s *NotificationService) Configured() bool {
+	return s.ServerKey != ""
+}
+
+type fcmNotification struct {
+	Title string `json:"title"`
+	Body  string `json:"body"`
+}
+
+type fcmRequest struct {
+	To           string          `json:"to"`
+	Notification fcmNotification `json:"notification"`
+}
+
+// payload encodes a message as JSON. Encoding it properly matters: titles and
+// descriptions come from the admin form and may contain quotes, backslashes
+// and line breaks.
+func payload(msg PushMessage) ([]byte, error) {
+	return json.Marshal(fcmRequest{To: msg.Token, Notification: fcmNotification{Title: msg.Title, Body: msg.Body}})
+}
+
+// Send delivers one message and returns an error when it was not accepted,
+// so callers can count and log failures instead of assuming success.
 func (s *NotificationService) Send(ctx context.Context, msg PushMessage) error {
-	payload := fmt.Sprintf(`{"to": "%s", "notification": {"title": "%s", "body": "%s"}}`, msg.Token, escape(msg.Title), escape(msg.Body))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.APIURL, strings.NewReader(payload))
+	body, err := payload(msg)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "key "+s.ServerKey)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.APIURL, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "key="+s.ServerKey)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := s.Client.Do(req)
 	if err != nil {
-		log.Printf("warning: push send simulated (offline?): %v", err)
-		return nil
+		return fmt.Errorf("send push: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		log.Printf("FCM returned status %d for token %s", resp.StatusCode, msg.Token)
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("send push: FCM returned %d: %s", resp.StatusCode, bytes.TrimSpace(snippet))
 	}
 	return nil
 }
-
-func escape(v string) string {
-	replacer := strings.NewReplacer(`"`, `'`)
-	return replacer.Replace(v)
-}
-

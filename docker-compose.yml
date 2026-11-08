@@ -21,6 +21,7 @@ services:
       DATABASE_URL: postgres://pns:pns@db:5432/pns?sslmode=disable
       SERVER_KEY: "dev-server-key-change-me"
       SESSION_SECRET: "change-me-session-secret"
+      FCM_SERVER_KEY: ""
       ADMIN_EMAIL: admin@example.com
       ADMIN_PASSWORD: admin123
     ports:

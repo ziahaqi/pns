@@ -2,7 +2,11 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
+	"errors"
+	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-contrib/sessions"
@@ -39,6 +43,10 @@ func New(cfg config.Config, ctx context.Context, repos struct {
 		Path:     "/",
 		MaxAge:   60 * 60 * 12,
 		HttpOnly: true,
+		// Lax keeps the cookie off cross-site POSTs, so another site cannot
+		// submit the admin forms (delete a user, activate a promotion) on an
+		// admin's behalf.
+		SameSite: http.SameSiteLaxMode,
 	})
 	r.Use(sessions.Sessions("pns_session", store))
 
@@ -49,7 +57,7 @@ func New(cfg config.Config, ctx context.Context, repos struct {
 		devices:  repos.Devices,
 		promos:   repos.Promos,
 		auth:     service.NewAuthService(repos.Users),
-		notifier: service.NewNotificationService(cfg.ServerKey),
+		notifier: service.NewNotificationService(cfg.FCMServerKey),
 		ctx:      ctx,
 	}
 
@@ -102,7 +110,7 @@ func (s *Server) serverKeyGuard() gin.HandlerFunc {
 		if key == "" {
 			key = c.GetHeader("server_key")
 		}
-		if key != s.cfg.ServerKey {
+		if subtle.ConstantTimeCompare([]byte(key), []byte(s.cfg.ServerKey)) != 1 {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid server key"})
 			return
 		}
@@ -137,7 +145,8 @@ func (s *Server) handleRegisterDevice(c *gin.Context) {
 	}
 	dt, err := s.devices.UpsertActive(c.Request.Context(), req.DeviceID, req.Token)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		log.Printf("register device %q: %v", req.DeviceID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not register device"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -324,44 +333,79 @@ func (s *Server) handlePromotionDeactivate(c *gin.Context) {
 	c.Redirect(http.StatusFound, "/admin/promotions")
 }
 
+var promotionStatuses = map[string]bool{"created": true, "active": true, "inactive": true}
+
 func (s *Server) promotionFromRequest(c *gin.Context) (model.Promotion, error) {
-	startStr := c.PostForm("start_date")
-	endStr := c.PostForm("end_date")
-	start, err := time.Parse("2006-01-02", startStr)
-	if err != nil {
-		return model.Promotion{}, err
+	title := strings.TrimSpace(c.PostForm("title"))
+	if title == "" {
+		return model.Promotion{}, errors.New("title is required")
 	}
-	end, err := time.Parse("2006-01-02", endStr)
+	start, err := time.Parse("2006-01-02", c.PostForm("start_date"))
 	if err != nil {
-		return model.Promotion{}, err
+		return model.Promotion{}, errors.New("start date must be a date (YYYY-MM-DD)")
+	}
+	end, err := time.Parse("2006-01-02", c.PostForm("end_date"))
+	if err != nil {
+		return model.Promotion{}, errors.New("end date must be a date (YYYY-MM-DD)")
+	}
+	if end.Before(start) {
+		return model.Promotion{}, errors.New("end date cannot be before the start date")
+	}
+	status := c.PostForm("status")
+	if status == "" {
+		status = "created"
+	}
+	if !promotionStatuses[status] {
+		return model.Promotion{}, errors.New("status must be created, active or inactive")
 	}
 	return model.Promotion{
-		Title:       c.PostForm("title"),
+		Title:       title,
 		ImageURL:    c.PostForm("image_url"),
 		Description: c.PostForm("description"),
 		StartDate:   start,
 		EndDate:     end,
-		Status:      c.PostForm("status"),
+		Status:      status,
 	}, nil
 }
 
+// pushPromotion sends the promotion to every active device token. Each send
+// gets its own timeout: a single deadline shared by the whole loop used to
+// expire after the first few tokens and silently skip the rest.
 func (s *Server) pushPromotion(promoID string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if !s.notifier.Configured() {
+		log.Printf("promotion %s activated, but FCM_SERVER_KEY is not set: no pushes sent", promoID)
+		return
+	}
+	ctx := context.Background()
+	lookup, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	promo, err := s.promos.Get(ctx, promoID)
+	promo, err := s.promos.Get(lookup, promoID)
 	if err != nil {
+		log.Printf("push promotion %s: load promotion: %v", promoID, err)
 		return
 	}
-	tokens, err := s.devices.ListActiveTokens(ctx)
+	tokens, err := s.devices.ListActiveTokens(lookup)
 	if err != nil {
+		log.Printf("push promotion %s: load device tokens: %v", promoID, err)
 		return
 	}
+
+	sent, failed := 0, 0
 	for _, t := range tokens {
-		_ = s.notifier.Send(ctx, service.PushMessage{
+		sendCtx, cancelSend := context.WithTimeout(ctx, 15*time.Second)
+		err := s.notifier.Send(sendCtx, service.PushMessage{
 			Token: t.FCMToken,
 			Title: promo.Title,
 			Body:  promo.Description,
 		})
+		cancelSend()
+		if err != nil {
+			failed++
+			log.Printf("push promotion %s to device %s: %v", promoID, t.DeviceID, err)
+			continue
+		}
+		sent++
 	}
+	log.Printf("push promotion %s: %d sent, %d failed, %d tokens", promoID, sent, failed, len(tokens))
 }
 

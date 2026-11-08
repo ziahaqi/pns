@@ -26,6 +26,13 @@ func (r *DeviceRepository) UpsertActive(ctx context.Context, deviceID, token str
 	}
 	defer tx.Rollback(ctx)
 
+	// Serialize registrations for the same device: without this, two concurrent
+	// requests each deactivate the other's not-yet-committed token and both
+	// insert theirs as active. The lock is released when the transaction ends.
+	if _, err = tx.Exec(ctx, `select pg_advisory_xact_lock(hashtextextended($1, 0))`, deviceID); err != nil {
+		return model.DeviceToken{}, err
+	}
+
 	_, err = tx.Exec(ctx, `update device_tokens set status='inactive' where device_id=$1 and fcm_device_token <> $2`, deviceID, token)
 	if err != nil {
 		return model.DeviceToken{}, err
